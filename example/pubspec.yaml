@@ -22,6 +22,12 @@ dev_dependencies:
   flutter_test:
     sdk: flutter
 
+dependency_overrides:
+  sky_engine:
+    path: /Users/stuartmorgan/src/engine/src/out/host_debug_unopt/gen/dart-pkg/sky_engine
+  sky_services:
+    path: /Users/stuartmorgan/src/engine/src/out/host_debug_unopt/gen/dart-pkg/sky_services
+
 flutter:
   uses-material-design: true
 
