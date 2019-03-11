@@ -29,7 +29,7 @@
 
 #include <flutter_embedder.h>
 
-#include "library/common/client_wrapper/src/plugin_handler.h"
+#include "library/common/client_wrapper/include/flutter_desktop_embedding/plugin_registrar.h"
 #include "library/common/glfw/key_event_handler.h"
 #include "library/common/glfw/keyboard_hook_handler.h"
 #include "library/common/glfw/text_input_plugin.h"
@@ -62,22 +62,54 @@ struct FlutterEmbedderState {
   // The handle to the Flutter engine instance.
   FlutterEngine engine;
 
+  // The plugin registrar handle given to API clients.
+  std::unique_ptr<FlutterEmbedderPluginRegistrar> plugin_registrar;
+
   // Message dispatch manager for messages from the Flutter engine.
   std::unique_ptr<flutter_desktop_embedding::IncomingMessageDispatcher>
       message_dispatcher;
 
-  // The helper class managing plugin registration.
-  std::unique_ptr<flutter_desktop_embedding::PluginHandler> plugin_handler;
+  // The plugin registrar managing internal plugins.
+  std::unique_ptr<flutter_desktop_embedding::PluginRegistrar>
+      internal_plugin_registrar;
 
   // Handlers for keyboard events from GLFW.
   std::vector<std::unique_ptr<flutter_desktop_embedding::KeyboardHookHandler>>
       keyboard_hook_handlers;
+
+  // Whether or not to track mouse movements to send kHover events.
+  bool hover_tracking_enabled = false;
+
+  // Whether or not the pointer has been added (or if tracking is enabled, has
+  // been added since it was last removed).
+  bool pointer_currently_added = false;
 
   // The screen coordinates per inch on the primary monitor. Defaults to a sane
   // value based on pixel_ratio 1.0.
   double monitor_screen_coordinates_per_inch = kDpPerInch;
   // The ratio of pixels per screen coordinate for the window.
   double window_pixels_per_screen_coordinate = 1.0;
+};
+
+// Struct for storing state of a Flutter engine instance.
+struct FlutterEngineState {
+  // The handle to the Flutter engine instance.
+  FlutterEngine engine;
+};
+
+// State associated with the plugin registrar.
+struct FlutterEmbedderPluginRegistrar {
+  // The plugin messenger handle given to API clients.
+  std::unique_ptr<FlutterEmbedderMessenger> messenger;
+};
+
+// State associated with the messenger used to communicate with the engine.
+struct FlutterEmbedderMessenger {
+  // The Flutter engine this messenger sends outgoing messages to.
+  FlutterEngine engine;
+
+  // The message dispatcher for handling incoming messages.
+  flutter_desktop_embedding::IncomingMessageDispatcher *dispatcher;
 };
 
 static constexpr char kDefaultWindowTitle[] = "Flutter";
@@ -140,12 +172,22 @@ static void GLFWFramebufferSizeCallback(GLFWwindow *window, int width_px,
   FlutterEngineSendWindowMetricsEvent(state->engine, &event);
 }
 
-// When GLFW calls back to the window with a cursor position move, forwards to
-// FlutterEngine as a pointer event with appropriate phase.
-static void GLFWCursorPositionCallbackAtPhase(GLFWwindow *window,
-                                              FlutterPointerPhase phase,
-                                              double x, double y) {
+// Sends a pointer event to the Flutter engine with the given phase.
+static void SendPointerEventWithPhase(GLFWwindow *window,
+                                      FlutterPointerPhase phase, double x,
+                                      double y) {
   auto state = GetSavedEmbedderState(window);
+  // If sending anything other than an add, and the pointer isn't already added,
+  // synthesize an add to satisfy Flutter's expectations about events.
+  if (!state->pointer_currently_added && phase != FlutterPointerPhase::kAdd) {
+    SendPointerEventWithPhase(window, FlutterPointerPhase::kAdd, x, y);
+  }
+  // Don't double-add (e.g., if events are delivered out of order, so an add has
+  // already been synthesized).
+  if (state->pointer_currently_added && phase == FlutterPointerPhase::kAdd) {
+    return;
+  }
+
   FlutterPointerEvent event = {};
   event.struct_size = sizeof(event);
   event.phase = phase;
@@ -156,26 +198,61 @@ static void GLFWCursorPositionCallbackAtPhase(GLFWwindow *window,
           std::chrono::high_resolution_clock::now().time_since_epoch())
           .count();
   FlutterEngineSendPointerEvent(state->engine, &event, 1);
+
+  if (phase == FlutterPointerPhase::kAdd) {
+    state->pointer_currently_added = true;
+  } else if (phase == FlutterPointerPhase::kRemove) {
+    state->pointer_currently_added = false;
+  }
 }
 
-// Reports cursor move to the Flutter engine.
+// Reports the mouse entering or leaving the Flutter view.
+static void GLFWCursorEnterCallback(GLFWwindow *window, int entered) {
+  double x, y;
+  glfwGetCursorPos(window, &x, &y);
+  FlutterPointerPhase phase =
+      entered ? FlutterPointerPhase::kAdd : FlutterPointerPhase::kRemove;
+  SendPointerEventWithPhase(window, phase, x, y);
+}
+
+// Reports mouse movement to the Flutter engine.
 static void GLFWCursorPositionCallback(GLFWwindow *window, double x, double y) {
-  GLFWCursorPositionCallbackAtPhase(window, FlutterPointerPhase::kMove, x, y);
+  bool button_down =
+      glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS;
+  FlutterPointerPhase phase =
+      button_down ? FlutterPointerPhase::kMove : FlutterPointerPhase::kHover;
+  SendPointerEventWithPhase(window, phase, x, y);
 }
 
 // Reports mouse button press to the Flutter engine.
 static void GLFWMouseButtonCallback(GLFWwindow *window, int key, int action,
                                     int mods) {
-  double x, y;
-  if (key == GLFW_MOUSE_BUTTON_1 && action == GLFW_PRESS) {
-    glfwGetCursorPos(window, &x, &y);
-    GLFWCursorPositionCallbackAtPhase(window, FlutterPointerPhase::kDown, x, y);
-    glfwSetCursorPosCallback(window, GLFWCursorPositionCallback);
+  // Flutter currently doesn't understand other buttons, so ignore anything
+  // other than left.
+  if (key != GLFW_MOUSE_BUTTON_LEFT) {
+    return;
   }
-  if (key == GLFW_MOUSE_BUTTON_1 && action == GLFW_RELEASE) {
-    glfwGetCursorPos(window, &x, &y);
-    GLFWCursorPositionCallbackAtPhase(window, FlutterPointerPhase::kUp, x, y);
-    glfwSetCursorPosCallback(window, nullptr);
+
+  double x, y;
+  glfwGetCursorPos(window, &x, &y);
+  FlutterPointerPhase phase = (action == GLFW_PRESS)
+                                  ? FlutterPointerPhase::kDown
+                                  : FlutterPointerPhase::kUp;
+  SendPointerEventWithPhase(window, phase, x, y);
+
+  // If mouse tracking isn't already enabled, turn it on for the duration of
+  // the drag to generate kMove events.
+  bool hover_enabled = GetSavedEmbedderState(window)->hover_tracking_enabled;
+  if (!hover_enabled) {
+    glfwSetCursorPosCallback(
+        window, (action == GLFW_PRESS) ? GLFWCursorPositionCallback : nullptr);
+  }
+  // Disable enter/exit events while the mouse button is down; GLFW will send
+  // an exit event when the mouse button is released, and the pointer should
+  // stay valid until then.
+  if (hover_enabled) {
+    glfwSetCursorEnterCallback(
+        window, (action == GLFW_PRESS) ? nullptr : GLFWCursorEnterCallback);
   }
 }
 
@@ -196,12 +273,23 @@ static void GLFWKeyCallback(GLFWwindow *window, int key, int scancode,
   }
 }
 
+// Enables/disables the callbacks related to mouse tracking.
+static void SetHoverCallbacksEnabled(GLFWwindow *window, bool enabled) {
+  glfwSetCursorEnterCallback(window,
+                             enabled ? GLFWCursorEnterCallback : nullptr);
+  glfwSetCursorPosCallback(window,
+                           enabled ? GLFWCursorPositionCallback : nullptr);
+}
+
 // Flushes event queue and then assigns default window callbacks.
 static void GLFWAssignEventCallbacks(GLFWwindow *window) {
   glfwPollEvents();
   glfwSetKeyCallback(window, GLFWKeyCallback);
   glfwSetCharCallback(window, GLFWCharCallback);
   glfwSetMouseButtonCallback(window, GLFWMouseButtonCallback);
+  if (GetSavedEmbedderState(window)->hover_tracking_enabled) {
+    SetHoverCallbacksEnabled(window, true);
+  }
 }
 
 // Clears default window events.
@@ -209,6 +297,7 @@ static void GLFWClearEventCallbacks(GLFWwindow *window) {
   glfwSetKeyCallback(window, nullptr);
   glfwSetCharCallback(window, nullptr);
   glfwSetMouseButtonCallback(window, nullptr);
+  SetHoverCallbacksEnabled(window, false);
 }
 
 // The Flutter Engine calls out to this function when new platform messages are
@@ -281,7 +370,8 @@ static void GLFWErrorCallback(int error_code, const char *description) {
 // Spins up an instance of the Flutter Engine.
 //
 // This function launches the Flutter Engine in a background thread, supplying
-// the necessary callbacks for rendering within a GLFWwindow.
+// the necessary callbacks for rendering within a GLFWwindow (if one is
+// provided).
 //
 // Returns a caller-owned pointer to the engine.
 static FlutterEngine RunFlutterEngine(GLFWwindow *window,
@@ -298,13 +388,23 @@ static FlutterEngine RunFlutterEngine(GLFWwindow *window,
   }
 
   FlutterRendererConfig config = {};
-  config.type = kOpenGL;
-  config.open_gl.struct_size = sizeof(config.open_gl);
-  config.open_gl.make_current = GLFWMakeContextCurrent;
-  config.open_gl.clear_current = GLFWClearContext;
-  config.open_gl.present = GLFWPresent;
-  config.open_gl.fbo_callback = GLFWGetActiveFbo;
-  config.open_gl.gl_proc_resolver = GLFWProcResolver;
+  if (window == nullptr) {
+    config.type = kOpenGL;
+    config.open_gl.struct_size = sizeof(config.open_gl);
+    config.open_gl.make_current = [](void *data) -> bool { return false; };
+    config.open_gl.clear_current = [](void *data) -> bool { return false; };
+    config.open_gl.present = [](void *data) -> bool { return false; };
+    config.open_gl.fbo_callback = [](void *data) -> uint32_t { return 0; };
+  } else {
+    // Provide the necessary callbacks for rendering within a GLFWwindow.
+    config.type = kOpenGL;
+    config.open_gl.struct_size = sizeof(config.open_gl);
+    config.open_gl.make_current = GLFWMakeContextCurrent;
+    config.open_gl.clear_current = GLFWClearContext;
+    config.open_gl.present = GLFWPresent;
+    config.open_gl.fbo_callback = GLFWGetActiveFbo;
+    config.open_gl.gl_proc_resolver = GLFWProcResolver;
+  }
   FlutterProjectArgs args = {};
   args.struct_size = sizeof(FlutterProjectArgs);
   args.assets_path = assets_path;
@@ -358,19 +458,32 @@ FlutterWindowRef FlutterEmbedderCreateWindow(
   state->window = window;
   glfwSetWindowUserPointer(window, state);
   state->engine = engine;
+
+  // TODO: Restructure the embedder internals to follow the structure of the
+  // C++ API, so that this isn't a tangle of references.
+  auto messenger = std::make_unique<FlutterEmbedderMessenger>();
   state->message_dispatcher =
       std::make_unique<flutter_desktop_embedding::IncomingMessageDispatcher>(
-          state);
-  state->plugin_handler =
-      std::make_unique<flutter_desktop_embedding::PluginHandler>(state);
+          messenger.get());
+  messenger->engine = engine;
+  messenger->dispatcher = state->message_dispatcher.get();
+
+  state->plugin_registrar = std::make_unique<FlutterEmbedderPluginRegistrar>();
+  state->plugin_registrar->messenger = std::move(messenger);
+
+  state->internal_plugin_registrar =
+      std::make_unique<flutter_desktop_embedding::PluginRegistrar>(
+          state->plugin_registrar.get());
 
   // Set up the keyboard handlers.
+  auto internal_plugin_messenger =
+      state->internal_plugin_registrar->messenger();
   state->keyboard_hook_handlers.push_back(
       std::make_unique<flutter_desktop_embedding::KeyEventHandler>(
-          state->plugin_handler.get()));
+          internal_plugin_messenger));
   state->keyboard_hook_handlers.push_back(
       std::make_unique<flutter_desktop_embedding::TextInputPlugin>(
-          state->plugin_handler.get()));
+          internal_plugin_messenger));
 
   // Trigger an initial size callback to send size information to Flutter.
   state->monitor_screen_coordinates_per_inch = GetScreenCoordinatesPerInch();
@@ -385,6 +498,33 @@ FlutterWindowRef FlutterEmbedderCreateWindow(
   return state;
 }
 
+bool FlutterEmbedderShutDownEngine(FlutterEngineRef engine_ref) {
+  std::cout << "Shutting down flutter engine process." << std::endl;
+  auto result = FlutterEngineShutdown(engine_ref->engine);
+  delete engine_ref;
+  return (result == kSuccess);
+}
+
+FlutterEngineRef FlutterEmbedderRunEngine(const char *assets_path,
+                                          const char *icu_data_path,
+                                          const char **arguments,
+                                          size_t argument_count) {
+  auto engine = RunFlutterEngine(nullptr, assets_path, icu_data_path, arguments,
+                                 argument_count);
+  if (engine == nullptr) {
+    return nullptr;
+  }
+  auto engine_state = new FlutterEngineState();
+  engine_state->engine = engine;
+  return engine_state;
+}
+
+void FlutterEmbedderSetHoverEnabled(FlutterWindowRef flutter_window,
+                                    bool enabled) {
+  flutter_window->hover_tracking_enabled = enabled;
+  SetHoverCallbacksEnabled(flutter_window->window, enabled);
+}
+
 void FlutterEmbedderRunWindowLoop(FlutterWindowRef flutter_window) {
   GLFWwindow *window = flutter_window->window;
 #ifdef __linux__
@@ -392,13 +532,11 @@ void FlutterEmbedderRunWindowLoop(FlutterWindowRef flutter_window) {
   XInitThreads();
 #endif
   while (!glfwWindowShouldClose(window)) {
-#ifdef __linux__
     glfwPollEvents();
+#ifdef __linux__
     if (gtk_events_pending()) {
       gtk_main_iteration();
     }
-#else
-    glfwWaitEvents();
 #endif
     // TODO(awdavies): This will be deprecated soon.
     __FlutterEngineFlushPendingTasksNow();
@@ -408,9 +546,27 @@ void FlutterEmbedderRunWindowLoop(FlutterWindowRef flutter_window) {
   glfwDestroyWindow(window);
 }
 
-void FlutterEmbedderSendMessage(FlutterWindowRef flutter_window,
-                                const char *channel, const uint8_t *message,
-                                const size_t message_size) {
+FlutterEmbedderPluginRegistrarRef FlutterEmbedderGetPluginRegistrar(
+    FlutterWindowRef flutter_window, const char *plugin_name) {
+  // Currently, one registrar acts as the registrar for all plugins, so the
+  // name is ignored. It is part of the API to reduce churn in the future when
+  // aligning more closely with the Flutter registrar system.
+  return flutter_window->plugin_registrar.get();
+}
+
+void FlutterEmbedderRegistrarEnableInputBlocking(
+    FlutterEmbedderPluginRegistrarRef registrar, const char *channel) {
+  registrar->messenger->dispatcher->EnableInputBlockingForChannel(channel);
+}
+
+FlutterEmbedderMessengerRef FlutterEmbedderRegistrarGetMessenger(
+    FlutterEmbedderPluginRegistrarRef registrar) {
+  return registrar->messenger.get();
+}
+
+void FlutterEmbedderMessengerSend(FlutterEmbedderMessengerRef messenger,
+                                  const char *channel, const uint8_t *message,
+                                  const size_t message_size) {
   FlutterPlatformMessage platform_message = {
       sizeof(FlutterPlatformMessage),
       channel,
@@ -418,26 +574,19 @@ void FlutterEmbedderSendMessage(FlutterWindowRef flutter_window,
       message_size,
   };
 
-  FlutterEngineSendPlatformMessage(flutter_window->engine, &platform_message);
+  FlutterEngineSendPlatformMessage(messenger->engine, &platform_message);
 }
 
-void FlutterEmbedderSendMessageResponse(
-    FlutterWindowRef flutter_window,
+void FlutterEmbedderMessengerSendResponse(
+    FlutterEmbedderMessengerRef messenger,
     const FlutterEmbedderMessageResponseHandle *handle, const uint8_t *data,
     size_t data_length) {
-  FlutterEngineSendPlatformMessageResponse(flutter_window->engine, handle, data,
+  FlutterEngineSendPlatformMessageResponse(messenger->engine, handle, data,
                                            data_length);
 }
 
-void FlutterEmbedderSetMessageCallback(FlutterWindowRef flutter_window,
-                                       const char *channel,
-                                       FlutterEmbedderMessageCallback callback,
-                                       void *user_data) {
-  flutter_window->message_dispatcher->SetMessageCallback(channel, callback,
-                                                         user_data);
-}
-
-void FlutterEmbedderEnableInputBlocking(FlutterWindowRef flutter_window,
-                                        const char *channel) {
-  flutter_window->message_dispatcher->EnableInputBlockingForChannel(channel);
+void FlutterEmbedderMessengerSetCallback(
+    FlutterEmbedderMessengerRef messenger, const char *channel,
+    FlutterEmbedderMessageCallback callback, void *user_data) {
+  messenger->dispatcher->SetMessageCallback(channel, callback, user_data);
 }
