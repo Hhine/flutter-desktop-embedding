@@ -28,4 +28,10 @@ class Screen {
 
   /// The number of pixels per screen coordinate for this screen.
   final double scaleFactor;
+
+  @override
+  String toString() {
+    return 'Screen(frame: $frame, visibleFrame: $visibleFrame, '
+        'scaleFactor: $scaleFactor)';
+  }
 }

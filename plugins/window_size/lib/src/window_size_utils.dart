@@ -50,14 +50,27 @@ void setWindowFrame(Rect frame) async {
   WindowSizeChannel.instance.setWindowFrame(frame);
 }
 
-/// Sets the minimum [Size] of the window containing this Flutter instance.
-void setWindowMinSize(Size size) async {
-  WindowSizeChannel.instance.setWindowMinSize(size);
+/// Sets the [Size] of the window containing this Flutter instance, in screen
+/// coordinates, without changing its origin.
+///
+/// If [forContent] is true, the minimum will be for the content area of the
+/// window, rather than the window frame.
+void setWindowSize(Size size, {bool forContent = false}) async {
+  WindowSizeChannel.instance.setWindowSize(size, forContent: forContent);
+}
+
+/// Sets the minimum [Size] of the window containing this Flutter instance, in
+/// screen coordinates.
+///
+/// If [forContent] is true, the minimum will be for the content area of the
+/// window, rather than the window frame.
+void setWindowMinSize(Size size, {bool forContent = false}) async {
+  WindowSizeChannel.instance.setWindowMinSize(size, forContent: forContent);
 }
 
 /// Sets the maximum [Size] of the window containing this Flutter instance.
-void setWindowMaxSize(Size size) async {
-  WindowSizeChannel.instance.setWindowMaxSize(size);
+void setWindowMaxSize(Size size, {bool forContent = false}) async {
+  WindowSizeChannel.instance.setWindowMaxSize(size, forContent: forContent);
 }
 
 /// Sets the window title, as a [String], of the window containing this Flutter instance.
@@ -78,12 +91,14 @@ void setWindowTitleRepresentedUrl(Uri url) async {
   WindowSizeChannel.instance.setWindowTitleRepresentedUrl(url);
 }
 
-/// Gets the minimum [Size] of the window containing this Flutter instance.
+/// Gets the minimum [Size] of the window containing this Flutter instance,
+/// in screen coordinates.
 Future<Size> getWindowMinSize() async {
   return WindowSizeChannel.instance.getWindowMinSize();
 }
 
-/// Gets the maximum [Size] of the window containing this Flutter instance.
+/// Gets the maximum [Size] of the window containing this Flutter instance,
+/// in screen coordinates.
 Future<Size> getWindowMaxSize() async {
   return WindowSizeChannel.instance.getWindowMaxSize();
 }

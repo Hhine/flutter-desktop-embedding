@@ -19,14 +19,28 @@ import 'screen.dart';
 /// properties.
 class PlatformWindow {
   /// Create a new window.
-  PlatformWindow(this.frame, this.scaleFactor, this.screen);
+  PlatformWindow({
+    required this.frame,
+    required this.contentSize,
+    required this.scaleFactor,
+    this.screen,
+  });
 
   /// The frame of the screen, in screen coordinates.
   final Rect frame;
+
+  /// The size of the content area, in screen coordinates.
+  final Size contentSize;
 
   /// The number of pixels per screen coordinate for this screen.
   final double scaleFactor;
 
   /// The (or a) screen containing this window, if any.
   final Screen? screen;
+
+  @override
+  String toString() {
+    return 'PlatformWindow(frame: $frame, contentSize: $contentSize, '
+        'scaleFactor: $scaleFactor, screen: $screen)';
+  }
 }

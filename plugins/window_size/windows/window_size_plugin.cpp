@@ -36,18 +36,29 @@ const char kChannelName[] = "flutter/windowsize";
 const char kGetScreenListMethod[] = "getScreenList";
 const char kGetWindowInfoMethod[] = "getWindowInfo";
 const char kSetWindowFrameMethod[] = "setWindowFrame";
-const char kSetWindowMinimumSize[] = "setWindowMinimumSize";
-const char kSetWindowMaximumSize[] = "setWindowMaximumSize";
+const char kSetWindowSizeMethod[] = "setWindowSize";
+const char kSetWindowMinimumSizeMethod[] = "setWindowMinimumSize";
+const char kSetWindowMaximumSizeMethod[] = "setWindowMaximumSize";
 const char kSetWindowTitleMethod[] = "setWindowTitle";
 const char ksetWindowVisibilityMethod[] = "setWindowVisibility";
 const char kFrameKey[] = "frame";
+const char kContentSizeKey[] = "contentSize";
 const char kVisibleFrameKey[] = "visibleFrame";
 const char kScaleFactorKey[] = "scaleFactor";
 const char kScreenKey[] = "screen";
 
 const double kBaseDpi = 96.0;
 
+// Returns the size of |rect|.
+POINT GetSizeOfRect(const RECT &rect) {
+  POINT size = {rect.right - rect.left, rect.bottom - rect.top};
+  return size;
+}
+
 // Returns a POINT corresponding to channel representation of a size.
+//
+// Arguments after the first two are ignored, so it is safe to pass argument
+// lists that start with a size but contain other elements.
 POINT GetPointForPlatformChannelRepresentationSize(const EncodableList &size) {
   POINT point = {};
   point.x = static_cast<LONG>(std::get<double>(size[0]));
@@ -64,6 +75,14 @@ EncodableValue GetPlatformChannelRepresentationForRect(const RECT &rect) {
                      static_cast<double>(rect.left)),
       EncodableValue(static_cast<double>(rect.bottom) -
                      static_cast<double>(rect.top)),
+  });
+}
+
+// Returns the serializable form of |size| expected by the platform channel.
+EncodableValue GetPlatformChannelRepresentationForSize(const POINT &size) {
+  return EncodableValue(EncodableList{
+      EncodableValue(static_cast<double>(size.x)),
+      EncodableValue(static_cast<double>(size.y)),
   });
 }
 
@@ -104,6 +123,8 @@ EncodableValue GetPlatformChannelRepresentationForWindow(HWND window) {
   }
   RECT frame;
   ::GetWindowRect(window, &frame);
+  RECT content_frame;
+  ::GetClientRect(window, &content_frame);
   HMONITOR window_monitor =
       ::MonitorFromWindow(window, MONITOR_DEFAULTTOPRIMARY);
   double scale_factor = FlutterDesktopGetDpiForHWND(window) / kBaseDpi;
@@ -111,6 +132,8 @@ EncodableValue GetPlatformChannelRepresentationForWindow(HWND window) {
   return EncodableValue(EncodableMap{
       {EncodableValue(kFrameKey),
        GetPlatformChannelRepresentationForRect(frame)},
+      {EncodableValue(kContentSizeKey),
+       GetPlatformChannelRepresentationForSize(GetSizeOfRect(content_frame))},
       {EncodableValue(kScreenKey),
        GetPlatformChannelRepresentationForMonitor(window_monitor)},
       {EncodableValue(kScaleFactorKey), EncodableValue(scale_factor)},
@@ -119,6 +142,24 @@ EncodableValue GetPlatformChannelRepresentationForWindow(HWND window) {
 
 HWND GetRootWindow(flutter::FlutterView *view) {
   return ::GetAncestor(view->GetNativeWindow(), GA_ROOT);
+}
+
+// Returns the size to use for |window| to yield the given client_size.
+// This is computed manually based on the exiting window information, to avoid
+// complexities around knowing what the current DPI mode is, as required for
+// the Win32 APIs intended for this purpose.
+POINT GetWindowSizeForClientSize(HWND window, const POINT &client_size) {
+  RECT frame;
+  ::GetWindowRect(window, &frame);
+  POINT window_size = GetSizeOfRect(frame);
+  RECT content_frame;
+  ::GetClientRect(window, &content_frame);
+  POINT content_size = GetSizeOfRect(content_frame);
+  POINT new_size = {
+      client_size.x + (window_size.x - content_size.x),
+      client_size.y + (window_size.y - content_size.y),
+  };
+  return new_size;
 }
 
 class WindowSizePlugin : public flutter::Plugin {
@@ -208,21 +249,53 @@ void WindowSizePlugin::HandleMethodCall(
     ::SetWindowPos(GetRootWindow(registrar_->GetView()), nullptr, x, y, width,
                    height, SWP_NOACTIVATE | SWP_NOOWNERZORDER);
     result->Success();
-  } else if (method_call.method_name().compare(kSetWindowMinimumSize) == 0) {
-    const auto *size = std::get_if<EncodableList>(method_call.arguments());
-    if (!size || size->size() != 2) {
-      result->Error("Bad arguments", "Expected 2-element list");
+  } else if (method_call.method_name().compare(kSetWindowSizeMethod) == 0) {
+    const auto *args = std::get_if<EncodableList>(method_call.arguments());
+    if (!args || args->size() != 3) {
+      result->Error("Bad arguments", "Expected 3-element list");
       return;
     }
-    min_size_ = GetPointForPlatformChannelRepresentationSize(*size);
+    HWND window = GetRootWindow(registrar_->GetView());
+    POINT size = {
+        static_cast<int>(std::get<double>((*args)[0])),
+        static_cast<int>(std::get<double>((*args)[1])),
+    };
+    int for_content = std::get<bool>((*args)[2]);
+    if (for_content) {
+      size = GetWindowSizeForClientSize(window, size);
+    }
+    RECT frame;
+    ::GetWindowRect(window, &frame);
+    ::SetWindowPos(window, nullptr, frame.left, frame.top, size.x, size.y,
+                   SWP_NOACTIVATE | SWP_NOOWNERZORDER);
     result->Success();
-  } else if (method_call.method_name().compare(kSetWindowMaximumSize) == 0) {
-    const auto *size = std::get_if<EncodableList>(method_call.arguments());
-    if (!size || size->size() != 2) {
-      result->Error("Bad arguments", "Expected 2-element list");
+  } else if (method_call.method_name().compare(kSetWindowMinimumSizeMethod) ==
+             0) {
+    const auto *args = std::get_if<EncodableList>(method_call.arguments());
+    if (!args || args->size() != 3) {
+      result->Error("Bad arguments", "Expected 3-element list");
       return;
     }
-    max_size_ = GetPointForPlatformChannelRepresentationSize(*size);
+    min_size_ = GetPointForPlatformChannelRepresentationSize(*args);
+    int for_content = std::get<bool>((*args)[2]);
+    if (for_content) {
+      min_size_ = GetWindowSizeForClientSize(
+          GetRootWindow(registrar_->GetView()), min_size_);
+    }
+    result->Success();
+  } else if (method_call.method_name().compare(kSetWindowMaximumSizeMethod) ==
+             0) {
+    const auto *args = std::get_if<EncodableList>(method_call.arguments());
+    if (!args || args->size() != 3) {
+      result->Error("Bad arguments", "Expected 3-element list");
+      return;
+    }
+    max_size_ = GetPointForPlatformChannelRepresentationSize(*args);
+    int for_content = std::get<bool>((*args)[2]);
+    if (for_content) {
+      max_size_ = GetWindowSizeForClientSize(
+          GetRootWindow(registrar_->GetView()), max_size_);
+    }
     result->Success();
   } else if (method_call.method_name().compare(kSetWindowTitleMethod) == 0) {
     const auto *title = std::get_if<std::string>(method_call.arguments());

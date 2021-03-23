@@ -38,10 +38,21 @@ const String _getWindowInfoMethod = 'getWindowInfo';
 /// Takes a frame array, as documented for the value of _frameKey.
 const String _setWindowFrameMethod = 'setWindowFrame';
 
+/// The method name to set the size of a window.
+///
+/// Takes a window size array, with the value is a list of two doubles,
+/// followed by a bool for whether to treat that as a content area size:
+///   [width, height, forContent].
+///
+/// A value of zero for width or height is to be interpreted as
+/// unconstrained in that dimension.
+const String _setWindowSizeMethod = 'setWindowSize';
+
 /// The method name to set the minimum size of a window.
 ///
-/// Takes a window size array, with the value is a list of two doubles:
-///   [width, height].
+/// Takes a window size array, with the value is a list of two doubles,
+/// followed by a bool for whether to treat that as a content area size:
+///   [width, height, forContent].
 ///
 /// A value of zero for width or height is to be interpreted as
 /// unconstrained in that dimension.
@@ -49,8 +60,9 @@ const String _setWindowMinimumSizeMethod = 'setWindowMinimumSize';
 
 /// The method name to set the maximum size of a window.
 ///
-/// Takes a window size array, with the value is a list of two doubles:
-///   [width, height].
+/// Takes a window size array, with the value is a list of two doubles,
+/// followed by a bool for whether to treat that as a content area size:
+///   [width, height, forContent].
 ///
 /// A value of `-1` for width or height is to be interpreted as
 /// unconstrained in that dimension.
@@ -95,6 +107,11 @@ const String _setWindowVisibilityMethod = 'setWindowVisibility';
 /// The frame of a screen or window. The value is a list of four doubles:
 ///   [left, top, width, height]
 const String _frameKey = 'frame';
+
+/// The size of the content area of a window. The value is a list of two
+/// doubles:
+///    [width, height]
+const String _contentSizeKey = 'contentSize';
 
 /// The frame of a screen available for use by applications. The value format
 /// is the same as _frameKey's.
@@ -145,8 +162,12 @@ class WindowSizeChannel {
 
     final screenInfo = response[_screenKey];
     final screen = screenInfo == null ? null : _screenFromInfoMap(screenInfo);
-    return PlatformWindow(_rectFromLTWHList(response[_frameKey].cast<double>()),
-        response[_scaleFactorKey], screen);
+    return PlatformWindow(
+      frame: _rectFromLTWHList(response[_frameKey].cast<double>()),
+      contentSize: _sizeFromWHList(response[_contentSizeKey].cast<double>()),
+      scaleFactor: response[_scaleFactorKey],
+      screen: screen,
+    );
   }
 
   /// Sets the frame of the window containing this Flutter instance, in
@@ -163,9 +184,24 @@ class WindowSizeChannel {
   }
 
   /// Sets the minimum size of the window containing this Flutter instance.
-  void setWindowMinSize(Size size) async {
-    await _platformChannel
-        .invokeMethod(_setWindowMinimumSizeMethod, [size.width, size.height]);
+  void setWindowSize(Size size, {bool forContent = false}) async {
+    await _platformChannel.invokeMethod(
+        _setWindowSizeMethod, [size.width, size.height, forContent]);
+  }
+
+  /// Sets the minimum size of the window containing this Flutter instance.
+  void setWindowMinSize(Size size, {bool forContent = false}) async {
+    await _platformChannel.invokeMethod(
+        _setWindowMinimumSizeMethod, [size.width, size.height, forContent]);
+  }
+
+  /// Sets the maximum size of the window containing this Flutter instance.
+  void setWindowMaxSize(Size size, {bool forContent = false}) async {
+    await _platformChannel.invokeMethod(_setWindowMaximumSizeMethod, [
+      _channelRepresentationForMaxDimension(size.width),
+      _channelRepresentationForMaxDimension(size.height),
+      forContent,
+    ]);
   }
 
   /// Sets the visibility of the window.
@@ -176,14 +212,6 @@ class WindowSizeChannel {
   // Window maximum size unconstrained is passed over the channel as -1.
   double _channelRepresentationForMaxDimension(double size) {
     return size == double.infinity ? -1 : size;
-  }
-
-  /// Sets the maximum size of the window containing this Flutter instance.
-  void setWindowMaxSize(Size size) async {
-    await _platformChannel.invokeMethod(_setWindowMaximumSizeMethod, [
-      _channelRepresentationForMaxDimension(size.width),
-      _channelRepresentationForMaxDimension(size.height),
-    ]);
   }
 
   /// Sets the title of the window containing this Flutter instance.
